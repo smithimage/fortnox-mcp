@@ -2,6 +2,7 @@ import axios, { AxiosError } from "axios";
 import { FORTNOX_OAUTH_URL, TOKEN_REFRESH_BUFFER_MS } from "../constants.js";
 import { ITokenProvider, TokenInfo, AuthRequiredError } from "./types.js";
 import { getFortnoxCredentials } from "./credentials.js";
+import { getFileStorage } from "./storage/file.js";
 
 interface TokenResponse {
   access_token: string;
@@ -11,7 +12,12 @@ interface TokenResponse {
   scope: string;
 }
 
+const FILE_STORAGE_USER_ID = "local";
+
 // Local mode token provider
+// Supports optional file-based token persistence via FORTNOX_TOKEN_FILE env var.
+// This allows tokens to survive across process restarts and enables external
+// tools (like a renewal skill) to inject fresh tokens into a running server.
 export class EnvVarTokenProvider implements ITokenProvider {
   private clientId: string;
   private clientSecret: string;
@@ -35,6 +41,45 @@ export class EnvVarTokenProvider implements ITokenProvider {
         scope: process.env.FORTNOX_SCOPE || ""
       };
     }
+
+    // Try loading from file storage (may have fresher tokens than env vars)
+    this.loadFromFileStorage();
+  }
+
+  /**
+   * Check file storage for tokens that may be newer than the env var ones.
+   * This covers two cases:
+   * 1. The env var token expired but a previous run persisted a fresh one
+   * 2. An external tool (skill) wrote a fresh token to the file
+   */
+  private loadFromFileStorage(): void {
+    const fileStorage = getFileStorage();
+    if (!fileStorage) return;
+
+    // Synchronous-ish: getFileStorage reads synchronously under the hood
+    fileStorage.get(FILE_STORAGE_USER_ID).then(stored => {
+      if (stored?.refreshToken) {
+        // File tokens take precedence if they exist — they're likely fresher
+        // than the env var which was set at process start
+        console.error("[Auth] Loaded tokens from file storage");
+        this.tokens = stored;
+      }
+    }).catch(() => {
+      // Ignore file read errors, fall back to env vars
+    });
+  }
+
+  /**
+   * Persist tokens to file storage so they survive restarts and can be
+   * picked up if the env var becomes stale.
+   */
+  private persistToFileStorage(): void {
+    const fileStorage = getFileStorage();
+    if (!fileStorage || !this.tokens) return;
+
+    fileStorage.set(FILE_STORAGE_USER_ID, this.tokens).catch(err => {
+      console.error("[Auth] Failed to persist tokens to file:", err);
+    });
   }
 
   async getAccessToken(_userId?: string): Promise<string> {
@@ -108,7 +153,13 @@ export class EnvVarTokenProvider implements ITokenProvider {
 
   private async refreshAccessToken(): Promise<string> {
     if (!this.tokens?.refreshToken) {
-      throw new Error("No refresh token available");
+      // Last resort: check file storage for externally-injected tokens
+      const fileTokens = await this.tryLoadFromFileStorage();
+      if (fileTokens?.refreshToken) {
+        this.tokens = fileTokens;
+      } else {
+        throw new Error("No refresh token available");
+      }
     }
 
     const tokenUrl = `${FORTNOX_OAUTH_URL}/token`;
@@ -132,8 +183,47 @@ export class EnvVarTokenProvider implements ITokenProvider {
       this.storeTokens(response.data);
       return this.tokens!.accessToken;
     } catch (error) {
+      // If refresh failed, try file storage — an external tool may have
+      // written a fresh token since we last checked
+      const fileTokens = await this.tryLoadFromFileStorage();
+      if (fileTokens?.refreshToken && fileTokens.refreshToken !== this.tokens?.refreshToken) {
+        console.error("[Auth] Env token refresh failed, trying file storage token...");
+        this.tokens = fileTokens;
+        // Retry once with the file-based token
+        try {
+          const retryResponse = await axios.post<TokenResponse>(
+            tokenUrl,
+            new URLSearchParams({
+              grant_type: "refresh_token",
+              refresh_token: this.tokens.refreshToken
+            }),
+            {
+              headers: {
+                "Authorization": `Basic ${auth}`,
+                "Content-Type": "application/x-www-form-urlencoded"
+              }
+            }
+          );
+          this.storeTokens(retryResponse.data);
+          return this.tokens!.accessToken;
+        } catch (retryError) {
+          this.tokens = null;
+          throw this.handleAuthError(retryError, "Failed to refresh access token");
+        }
+      }
+
       this.tokens = null;
       throw this.handleAuthError(error, "Failed to refresh access token");
+    }
+  }
+
+  private async tryLoadFromFileStorage(): Promise<TokenInfo | null> {
+    const fileStorage = getFileStorage();
+    if (!fileStorage) return null;
+    try {
+      return await fileStorage.get(FILE_STORAGE_USER_ID);
+    } catch {
+      return null;
     }
   }
 
@@ -144,6 +234,7 @@ export class EnvVarTokenProvider implements ITokenProvider {
       expiresAt: Date.now() + response.expires_in * 1000,
       scope: response.scope
     };
+    this.persistToFileStorage();
   }
 
   private handleAuthError(error: unknown, context: string): Error {
