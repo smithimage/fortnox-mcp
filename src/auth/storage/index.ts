@@ -1,5 +1,6 @@
 export * from "./types.js";
 export { MemoryTokenStorage, getMemoryStorage } from "./memory.js";
+export { FileTokenStorage, getFileStorage } from "./file.js";
 export {
   UpstashRedisTokenStorage,
   VercelKVTokenStorage,
